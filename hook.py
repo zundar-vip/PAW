@@ -1,7 +1,7 @@
-# hook.py — SePay polling + webhook
 import asyncio
 import logging
 import datetime
+from typing import Optional
 
 import aiohttp
 from aiohttp import web
@@ -12,12 +12,16 @@ import pay
 
 log = logging.getLogger(__name__)
 
-SEPAY_API_BASE  = "https://userapi.sepay.vn"
-SEPAY_TX_LIST   = f"{SEPAY_API_BASE}/v2/transactions"
+SEPAY_ENDPOINTS = [
+    ("https://userapi.sepay.vn/v2/transactions", "v2"),
+    ("https://my.sepay.vn/userapi/transactions/list", "userapi"),
+]
 
 _credit_fn = None
 _notify_admin_tx_fn = None
+
 _seen_tx_ids: set[str] = set()
+_first_fetch_logged = False
 
 
 def set_credit_callback(fn):
@@ -29,8 +33,6 @@ def set_notify_admin_callback(fn):
     global _notify_admin_tx_fn
     _notify_admin_tx_fn = fn
 
-
-# ─────────────────────────── SEPAY POLLING ──────────────────────────
 
 async def poll_sepay_loop():
     log.info(f"SePay polling started — interval={SEPAY_POLL_INTERVAL}s")
@@ -44,7 +46,7 @@ async def poll_sepay_loop():
                 log.info("SePay polling cancelled")
                 return
             except Exception as e:
-                log.error(f"SePay poll error: {e}")
+                log.error(f"SePay poll error: {e}", exc_info=True)
             await asyncio.sleep(SEPAY_POLL_INTERVAL)
 
 
@@ -60,60 +62,147 @@ async def _init_seen():
 
 
 async def _fetch_transactions(session: aiohttp.ClientSession, limit: int = 20) -> list[dict]:
-    headers = {"Authorization": f"Bearer {SEPAY_TOKEN}"}
-    params  = {
-        "limit":          limit,
-        "account_number": ACCOUNT_NO.replace(" ", ""),
+    global _first_fetch_logged
+
+    headers = {
+        "Authorization": f"Bearer {SEPAY_TOKEN.strip()}",
+        "Content-Type":  "application/json",
+        "Accept":        "application/json",
     }
-    async with session.get(SEPAY_TX_LIST, headers=headers, params=params,
-                           timeout=aiohttp.ClientTimeout(total=15)) as resp:
-        if resp.status != 200:
-            text = await resp.text()
-            log.warning(f"SePay API HTTP {resp.status}: {text[:300]}")
-            return []
 
-        body = await resp.json(content_type=None)
+    for url, tag in SEPAY_ENDPOINTS:
+        params = {"limit": limit}
+        if tag == "userapi":
+            params["account_number"] = ACCOUNT_NO.replace(" ", "")
 
-        st = body.get("status")
-        if st and st != "success":
-            log.warning(f"SePay API status != success: {str(body)[:300]}")
-            return []
+        try:
+            async with session.get(url, headers=headers, params=params,
+                                   timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                text = await resp.text()
 
-        err = body.get("error")
-        if err is not None and err != 0:
-            log.warning(f"SePay API error: {str(body)[:300]}")
-            return []
+                if resp.status != 200:
+                    log.debug(f"SePay[{tag}] HTTP {resp.status}: {text[:200]}")
+                    continue
 
-        txs = body.get("data") or body.get("messages", {}).get("data") or []
-        if not isinstance(txs, list):
-            log.warning(f"SePay unexpected data type: {type(txs)} — {str(txs)[:200]}")
-            return []
-        return txs
+                try:
+                    body = await resp.json(content_type=None)
+                except Exception:
+                    log.warning(f"SePay[{tag}] non-JSON: {text[:200]}")
+                    continue
+
+                if not _first_fetch_logged:
+                    log.info(f"SePay[{tag}] first response keys: {list(body.keys()) if isinstance(body, dict) else type(body)}")
+                    if isinstance(body, dict) and body:
+                        for k in ("transactions", "data", "messages"):
+                            v = body.get(k)
+                            if isinstance(v, list) and v:
+                                log.info(f"  └ {k}[0] keys: {list(v[0].keys())}")
+                                break
+                    _first_fetch_logged = True
+
+                txs = _extract_tx_list(body)
+                if txs:
+                    log.debug(f"SePay[{tag}] → {len(txs)} tx")
+                    return txs
+
+                err = body.get("error") if isinstance(body, dict) else None
+                if err not in (None, 0, "0", False, ""):
+                    log.debug(f"SePay[{tag}] error field: {err}")
+
+        except Exception as e:
+            log.debug(f"SePay[{tag}] exception: {e}")
+            continue
+
+    log.warning("SePay: all endpoints returned empty/error")
+    return []
+
+
+def _extract_tx_list(body) -> list[dict]:
+    if isinstance(body, list):
+        return body
+    if not isinstance(body, dict):
+        return []
+
+    for path in (
+        ("transactions",),
+        ("data",),
+        ("messages", "transactions"),
+        ("messages", "data"),
+        ("data", "transactions"),
+        ("result", "transactions"),
+        ("result", "data"),
+    ):
+        cur = body
+        ok = True
+        for k in path:
+            if isinstance(cur, dict) and k in cur:
+                cur = cur[k]
+            else:
+                ok = False
+                break
+        if ok and isinstance(cur, list) and cur:
+            return cur
+
+    return []
 
 
 def _tx_amount_in(tx: dict) -> int:
-    return int(tx.get("amount_in") or tx.get("transferAmount") or 0)
+    for k in ("amount_in", "transferAmount", "credit", "amount"):
+        v = tx.get(k)
+        if v is None:
+            continue
+        try:
+            n = int(v)
+            if n > 0:
+                return n
+        except (TypeError, ValueError):
+            continue
+    return 0
 
 
 def _tx_content(tx: dict) -> str:
-    return str(tx.get("transaction_content") or tx.get("content") or "")
+    return str(
+        tx.get("transaction_content")
+        or tx.get("content")
+        or tx.get("description")
+        or ""
+    )
+
+
+def _tx_ref(tx: dict) -> Optional[str]:
+    ref = pay.parse_ref(_tx_content(tx))
+    if ref:
+        return ref
+    code = str(tx.get("code") or "").strip()
+    if code:
+        return pay.parse_ref(code.upper())
+    return None
 
 
 async def _poll_once(session: aiohttp.ClientSession):
     txs = await _fetch_transactions(session, limit=20)
+    if not txs:
+        return
+
+    new_count = 0
     for tx in txs:
         tx_id = str(tx.get("id", ""))
         if not tx_id or tx_id in _seen_tx_ids:
             continue
         _seen_tx_ids.add(tx_id)
+        new_count += 1
+
         amount_in = _tx_amount_in(tx)
-        content   = _tx_content(tx)
         if amount_in <= 0:
             continue
+
+        content = _tx_content(tx)
+        log.info(f"[poll] new tx id={tx_id} amount={amount_in} content={content[:80]!r}")
         await _process({"amount": amount_in, "description": content}, source="poll")
 
+    if new_count:
+        log.info(f"[poll] processed {new_count} new tx")
 
-# ─────────────────────────── WEBHOOK ────────────────────────────────
 
 async def handle_sepay(req: web.Request) -> web.Response:
     try:
@@ -127,7 +216,8 @@ async def handle_sepay(req: web.Request) -> web.Response:
     if tx_id:
         _seen_tx_ids.add(tx_id)
 
-    if body.get("transferType", "in") != "in":
+    transfer_type = body.get("transferType", "in")
+    if transfer_type != "in":
         return web.json_response({"success": True})
 
     amount  = int(body.get("transferAmount") or body.get("credit") or body.get("amount_in") or 0)
@@ -135,6 +225,7 @@ async def handle_sepay(req: web.Request) -> web.Response:
 
     if amount > 0:
         await _process({"amount": amount, "description": content}, source="webhook")
+
     return web.json_response({"success": True})
 
 
@@ -142,11 +233,10 @@ async def health(_: web.Request) -> web.Response:
     return web.Response(text="OK")
 
 
-# ─────────────────────────── CORE PROCESS ───────────────────────────
-
 async def _process(rec: dict, source: str = "?"):
     amount = int(rec.get("amount", 0))
     desc   = str(rec.get("description", ""))
+
     if amount <= 0:
         return
 
@@ -177,53 +267,12 @@ async def _process(rec: dict, source: str = "?"):
         log.warning(f"[{source}] Underpayment: ref={ref} expected={expected} got={amount}")
 
     log.info(f"[{source}] ✅ Payment confirmed: ref={ref} uid={uid} amount={amount}")
+
     if _credit_fn:
         await _credit_fn(uid, amount, ref, pmt["payment_id"])
 
 
-# ─────────────────────────── PER-PAYMENT WATCHER ────────────────────
-
-async def watch_payment_ref(ref: str, uid: int, poll_interval: int = 5, timeout_secs: int = 900):
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout_secs
-    await asyncio.sleep(3)
-
-    async with aiohttp.ClientSession() as session:
-        while True:
-            if loop.time() > deadline:
-                log.debug(f"watch_payment_ref: timeout ref={ref}")
-                return
-            pmt = db.get_payment_by_ref(ref)
-            if pmt is None:
-                return
-            try:
-                txs = await _fetch_transactions(session, limit=20)
-                for tx in txs:
-                    tx_id = str(tx.get("id", ""))
-                    if not tx_id or tx_id in _seen_tx_ids:
-                        continue
-                    amount_in = _tx_amount_in(tx)
-                    content   = _tx_content(tx)
-                    if amount_in <= 0:
-                        continue
-                    if pay.parse_ref(content) != ref:
-                        continue
-                    _seen_tx_ids.add(tx_id)
-                    log.info(f"watch_payment_ref: matched tx_id={tx_id} ref={ref}")
-                    await _process({"amount": amount_in, "description": content}, source="watch")
-                    return
-            except asyncio.CancelledError:
-                return
-            except Exception as e:
-                log.warning(f"watch_payment_ref poll error ref={ref}: {e}")
-            await asyncio.sleep(poll_interval)
-
-
-# ─────────────────────────── MANUAL CHECK (FIX TREO QR) ─────────────
-
-async def check_payment_now(ref: str) -> dict:
-    """Kiểm tra giao dịch ngay lập tức khi user bấm nút Check Bank"""
-    # 1. Kiểm tra trạng thái trong DB trước
+async def check_payment_now(ref: str, limit: int = 30) -> dict:
     try:
         c = db._conn()
         row = c.execute("SELECT status FROM pending_payments WHERE order_ref=?", (ref,)).fetchone()
@@ -240,7 +289,6 @@ async def check_payment_now(ref: str) -> dict:
     if not pmt:
         return {"found": False, "reason": "not_found"}
 
-    # 2. Kiểm tra hết hạn
     if pmt.get("expires_at"):
         try:
             if datetime.datetime.now() > datetime.datetime.fromisoformat(pmt["expires_at"]):
@@ -248,22 +296,24 @@ async def check_payment_now(ref: str) -> dict:
         except Exception:
             pass
 
-    # 3. Gọi API SePay để quét ngay lập tức
     try:
         async with aiohttp.ClientSession() as session:
-            txs = await _fetch_transactions(session, limit=20)
-            for tx in txs:
-                amount_in = _tx_amount_in(tx)
-                content = _tx_content(tx)
-                if amount_in <= 0:
-                    continue
-                if pay.parse_ref(content) == ref:
-                    tx_id = str(tx.get("id", ""))
-                    if tx_id not in _seen_tx_ids:
-                        _seen_tx_ids.add(tx_id)
-                        # Kích hoạt xử lý tạo key
-                        await _process({"amount": amount_in, "description": content}, source="manual_check")
-                    return {"found": True}
+            txs = await _fetch_transactions(session, limit=limit)
+        
+        for tx in txs:
+            if _tx_ref(tx) != ref:
+                continue
+            amount = _tx_amount_in(tx)
+            if amount <= 0:
+                continue
+            
+            tx_id = str(tx.get("id", ""))
+            _seen_tx_ids.add(tx_id)
+            
+            log.info(f"[manual_check] matched tx_id={tx_id} ref={ref}")
+            await _process({"amount": amount, "description": _tx_content(tx)}, source="manual_check")
+            return {"found": True, "reason": "success"}
+            
     except Exception as e:
         log.error(f"check_payment_now error: {e}")
         return {"found": False, "reason": "fetch_error"}
@@ -271,11 +321,53 @@ async def check_payment_now(ref: str) -> dict:
     return {"found": False, "reason": "not_yet"}
 
 
-# ─────────────────────────── QR EXPIRE LOOP ─────────────────────────
+async def watch_payment_ref(ref: str, uid: int,
+                            poll_interval: int = 5,
+                            timeout_secs: int = 900):
+    deadline = asyncio.get_event_loop().time() + timeout_secs
+    await asyncio.sleep(3)
+
+    async with aiohttp.ClientSession() as session:
+        while True:
+            if asyncio.get_event_loop().time() > deadline:
+                log.debug(f"watch_payment_ref: timeout ref={ref}")
+                return
+
+            if db.get_payment_by_ref(ref) is None:
+                return
+
+            try:
+                txs = await _fetch_transactions(session, limit=20)
+                for tx in txs:
+                    if _tx_ref(tx) != ref:
+                        continue
+                    amount = _tx_amount_in(tx)
+                    if amount <= 0:
+                        continue
+                    tx_id = str(tx.get("id", ""))
+                    _seen_tx_ids.add(tx_id)
+                    log.info(f"watch_payment_ref: matched tx_id={tx_id} ref={ref}")
+                    await _process({"amount": amount, "description": _tx_content(tx)},
+                                   source="watch")
+                    return
+
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                log.warning(f"watch_payment_ref poll error ref={ref}: {e}")
+
+            await asyncio.sleep(poll_interval)
+
 
 async def _handle_expired(bot, pmt: dict, kb_main_fn):
+    fresh = db.get_payment_by_id(pmt["payment_id"])
+    if fresh and fresh.get("status") == "completed":
+        log.info(f"skip expired notify: {pmt['payment_id']} already completed")
+        return
+
     uid    = pmt["user_id"]
     msg_id = pmt.get("message_id", 0)
+
     if msg_id:
         try:
             await bot.delete_message(chat_id=uid, message_id=msg_id)
@@ -287,14 +379,16 @@ async def _handle_expired(bot, pmt: dict, kb_main_fn):
         name = user.get("full_name") or user.get("username") or "Khách"
         welcome = (
             "⏰ <b>QR CODE ĐÃ HẾT HẠN</b>\n"
-            "─────────────────────────\n"
-            "Mã QR hết hạn sau <b>15 phút</b> không có giao dịch.\n\n"
-            f"👋 Chào <b>{name}</b>!\n"
+            "─────────────────────────────\n"
+            "Mã QR hết hạn không có giao dịch.\n\n"
+        
+            f"👋 Chào <b>{name}</b>!\n\n"
             f"🆔 ID: <code>{uid}</code>\n"
-            f"💰 Số dư: <b>{pay.fmt(user['balance'])}</b>"
+            f"💰 Số dư: <b>{pay.fmt(user['balance'])}</b>\n\n"
+            "⬇️ Chọn thao tác bên dưới:"
         )
     else:
-        welcome = "⏰ <b>QR CODE ĐÃ HẾT HẠN</b>\nVui lòng chọn lại nếu muốn tiếp tục."
+        welcome = "⏰ <b>QR CODE ĐÃ HẾT HẠN</b>\n\nVui lòng chọn lại."
 
     try:
         await bot.send_message(uid, welcome, parse_mode="HTML", reply_markup=kb_main_fn())
@@ -315,8 +409,6 @@ async def expire_qr_loop(bot, kb_main_fn):
         except Exception as e:
             log.error(f"expire loop: {e}")
 
-
-# ─────────────────────────── SERVER ─────────────────────────────────
 
 def build_server() -> web.Application:
     app = web.Application()
