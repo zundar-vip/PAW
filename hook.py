@@ -1,6 +1,7 @@
 # hook.py — SePay polling + webhook
 import asyncio
 import logging
+import datetime
 
 import aiohttp
 from aiohttp import web
@@ -73,13 +74,11 @@ async def _fetch_transactions(session: aiohttp.ClientSession, limit: int = 20) -
 
         body = await resp.json(content_type=None)
 
-        # SePay v2: {"status":"success","data":[...],...}
         st = body.get("status")
         if st and st != "success":
             log.warning(f"SePay API status != success: {str(body)[:300]}")
             return []
 
-        # Legacy field — chỉ warn khi có error thực sự
         err = body.get("error")
         if err is not None and err != 0:
             log.warning(f"SePay API error: {str(body)[:300]}")
@@ -218,6 +217,58 @@ async def watch_payment_ref(ref: str, uid: int, poll_interval: int = 5, timeout_
             except Exception as e:
                 log.warning(f"watch_payment_ref poll error ref={ref}: {e}")
             await asyncio.sleep(poll_interval)
+
+
+# ─────────────────────────── MANUAL CHECK (FIX TREO QR) ─────────────
+
+async def check_payment_now(ref: str) -> dict:
+    """Kiểm tra giao dịch ngay lập tức khi user bấm nút Check Bank"""
+    # 1. Kiểm tra trạng thái trong DB trước
+    try:
+        c = db._conn()
+        row = c.execute("SELECT status FROM pending_payments WHERE order_ref=?", (ref,)).fetchone()
+        c.close()
+        if row:
+            if row["status"] == "completed":
+                return {"found": True, "reason": "already_completed"}
+            elif row["status"] == "expired":
+                return {"found": False, "reason": "expired"}
+    except Exception:
+        pass
+
+    pmt = db.get_payment_by_ref(ref)
+    if not pmt:
+        return {"found": False, "reason": "not_found"}
+
+    # 2. Kiểm tra hết hạn
+    if pmt.get("expires_at"):
+        try:
+            if datetime.datetime.now() > datetime.datetime.fromisoformat(pmt["expires_at"]):
+                return {"found": False, "reason": "expired"}
+        except Exception:
+            pass
+
+    # 3. Gọi API SePay để quét ngay lập tức
+    try:
+        async with aiohttp.ClientSession() as session:
+            txs = await _fetch_transactions(session, limit=20)
+            for tx in txs:
+                amount_in = _tx_amount_in(tx)
+                content = _tx_content(tx)
+                if amount_in <= 0:
+                    continue
+                if pay.parse_ref(content) == ref:
+                    tx_id = str(tx.get("id", ""))
+                    if tx_id not in _seen_tx_ids:
+                        _seen_tx_ids.add(tx_id)
+                        # Kích hoạt xử lý tạo key
+                        await _process({"amount": amount_in, "description": content}, source="manual_check")
+                    return {"found": True}
+    except Exception as e:
+        log.error(f"check_payment_now error: {e}")
+        return {"found": False, "reason": "fetch_error"}
+
+    return {"found": False, "reason": "not_yet"}
 
 
 # ─────────────────────────── QR EXPIRE LOOP ─────────────────────────
