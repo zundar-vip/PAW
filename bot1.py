@@ -107,7 +107,7 @@ def txt_welcome(u):
     name = u.get("full_name") or u.get("username") or "Khách"
     return (
         "╔═══════════════════════════╗\n"
-        "║  🔑  <b>PAWNOVA KEY SHOP</b>  🔑  ║\n"
+        "║  🔑  <b>Bot bán key paw</b>  🔑  ║\n"
         "╚═══════════════════════════╝\n\n"
         f"👋 Chào <b>{name}</b>!\n\n"
         f"🆔 ID: <code>{u['user_id']}</code>\n"
@@ -510,12 +510,15 @@ async def on_callback(update, ctx):
             lic = db.create_license(label=f"Bot · {user.get('username') or user['user_id']}",
                                     hours=hours, telegram_id=user["user_id"],
                                     package_id=pid, package_name=pkg_name)
-            db.new_order(user["user_id"], pid, pkg_name, price, lic["key_value"], status="completed")
         except Exception as e:
-            log.error(f"confirm_key error: {e}")
+            log.error(f"create_license error: {e}")
             db.credit(user["user_id"], price, ref_id=ref, desc=f"Hoàn tiền lỗi mua {pkg_name}")
             await reply(update, "❌ Có lỗi xảy ra khi tạo key. Đã hoàn lại tiền vào số dư. Vui lòng thử lại!")
             return
+        try:
+            db.new_order(user["user_id"], pid, pkg_name, price, lic["key_value"], status="completed")
+        except Exception as e:
+            log.error(f"new_order failed (key vẫn giao): {e}")
 
         ctx.user_data.pop("key_pending", None)
         await _deliver_key(ctx.bot, user["user_id"], lic, pkg_name, price)
@@ -679,7 +682,10 @@ async def credit_from_webhook(uid, amount, ref, pmt_id):
         hours    = int(od.get("hours", 24))
         lic = db.create_license(label=f"Bot QR · {uid}", hours=hours,
                                 telegram_id=uid, package_id=pkg_id, package_name=pkg_name)
-        db.new_order(uid, pkg_id, pkg_name, amount, lic["key_value"], status="completed")
+        try:
+            db.new_order(uid, pkg_id, pkg_name, amount, lic["key_value"], status="completed")
+        except Exception as e:
+            log.error(f"new_order failed (key vẫn giao): {e}")
         try:
             await _deliver_key(bot, uid, lic, pkg_name, amount)
         except Exception as e:
