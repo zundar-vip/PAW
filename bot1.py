@@ -266,7 +266,7 @@ async def _deliver_key(bot, uid, lic, pkg_name, amount):
         f"<code>{lic['key_value']}</code>\n"
         "─────────────────────────\n"
         "🌐 <b>HƯỚNG DẪN:</b>\n"
-        f"1. Mở website: <code>{PAWNOVA_WEB_URL}</code>\n"
+        f"1. Mở website: https://pawnovatoolvip.netlify.app\n"
         "2. Dán key vào ô nhập → nhấn KÍCH HOẠT\n"
         "3. Key chỉ dùng được trên 1 thiết bị — không chia sẻ"
     )
@@ -426,11 +426,12 @@ async def on_callback(update, ctx):
             await reply(update,
                 "🌐 <b>ĐỊA CHỈ WEBSITE</b>\n"
                 "─────────────────────────\n"
-                f"<code>{PAWNOVA_WEB_URL}</code>\n\n"
+                f"https://pawnovatoolvip.netlify.app\n\n"
                 "📱 <b>Bấm giữ để copy</b> rồi dán vào trình duyệt.\n\n"
-                "💡 Khi deploy lên domain public (VD <code>https://pawnova.vn</code>), "
+               
                 "link sẽ tự đổi thành nút bấm được.")
         elif sec == "free_key":
+            # Bỏ check nhận key tại đây, chuyển xuống cuối nhiệm vụ
             try:
                 member = await ctx.bot.get_chat_member(chat_id="@PAW8386", user_id=user["user_id"])
                 is_joined = member.status in ['member', 'administrator', 'creator']
@@ -457,6 +458,7 @@ async def on_callback(update, ctx):
             anh2 = os.path.join(base_dir, "NHIEMVU", "ANH2.jpg")
 
             try:
+                # SỬ DỤNG send_media_group ĐỂ GỬI 2 ẢNH CHUNG (ALBUM)
                 media_group = [
                     InputMediaPhoto(media=open(anh1, 'rb'), caption=caption),
                     InputMediaPhoto(media=open(anh2, 'rb'))
@@ -500,27 +502,14 @@ async def on_callback(update, ctx):
             return
         pid = pend["pkg_id"]; pkg_name = pend["pkg_name"]
         price = pend["price"]; hours = pend["hours"]
-        
-        # Tiến hành trừ tiền
         if not db.deduct(user["user_id"], price, ref_id=ref, desc=f"Mua {pkg_name}"):
-            # Nếu không đủ tiền, hiển thị QR
             await show_qr_key(update, ctx, price,
                               {"pkg_id": pid, "pkg_name": pkg_name, "hours": hours})
             return
-            
-        try:
-            # Tạo key và lưu đơn hàng
-            lic = db.create_license(label=f"Bot · {user.get('username') or user['user_id']}",
-                                    hours=hours, telegram_id=user["user_id"],
-                                    package_id=pid, package_name=pkg_name)
-            db.new_order(user["user_id"], pid, pkg_name, price, lic["key_value"], status="completed")
-        except Exception as e:
-            log.error(f"confirm_key error: {e}")
-            # Hoàn tiền lại nếu có lỗi xảy ra trong quá trình tạo key
-            db.credit(user["user_id"], price, ref_id=ref, desc=f"Hoàn tiền lỗi mua {pkg_name}")
-            await reply(update, "❌ Có lỗi xảy ra khi tạo key. Đã hoàn lại tiền vào số dư. Vui lòng thử lại!")
-            return
-
+        lic = db.create_license(label=f"Bot · {user.get('username') or user['user_id']}",
+                                hours=hours, telegram_id=user["user_id"],
+                                package_id=pid, package_name=pkg_name)
+        db.new_order(user["user_id"], pid, pkg_name, price, lic["key_value"], status="completed")
         ctx.user_data.pop("key_pending", None)
         await _deliver_key(ctx.bot, user["user_id"], lic, pkg_name, price)
         await _notify_admin_sold(user["user_id"], lic, pkg_name, price, ref, "Số dư")
@@ -615,6 +604,7 @@ async def on_message(update, ctx):
                 ctx.user_data.setdefault("proof_ids", []).append(photo_id)
                 count = len(ctx.user_data["proof_ids"])
                 if count >= 5:
+                    # KIỂM TRA ĐÃ NHẬN KEY FREE HÔM NAY CHƯA (sau khi đã làm xong nhiệm vụ)
                     if not db.can_get_free_key(update.effective_user.id):
                         await reply(update, "🕐 <b>HÔM NAY BẠN ĐÃ NHẬN KEY FREE RỒI</b>\n\nQuay lại vào ngày mai nhé!")
                         ctx.user_data["await"] = None
