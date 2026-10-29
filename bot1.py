@@ -266,7 +266,7 @@ async def _deliver_key(bot, uid, lic, pkg_name, amount):
         f"<code>{lic['key_value']}</code>\n"
         "─────────────────────────\n"
         "🌐 <b>HƯỚNG DẪN:</b>\n"
-        f"1. Mở website: <code>{PAWNOVA_WEB_URL}</code>\n"
+        f"1. Mở website: https://pawnovatoolvip.netlify.app/\n"
         "2. Dán key vào ô nhập → nhấn KÍCH HOẠT\n"
         "3. Key chỉ dùng được trên 1 thiết bị — không chia sẻ"
     )
@@ -426,7 +426,7 @@ async def on_callback(update, ctx):
             await reply(update,
                 "🌐 <b>ĐỊA CHỈ WEBSITE</b>\n"
                 "─────────────────────────\n"
-                f"<code>{PAWNOVA_WEB_URL}</code>\n\n"
+                f"https://pawnovatoolvip.netlify.app/\n\n"
                 "📱 <b>Bấm giữ để copy</b> rồi dán vào trình duyệt.\n\n"
                 "💡 Khi deploy lên domain public (VD <code>https://pawnova.vn</code>), "
                 "link sẽ tự đổi thành nút bấm được.")
