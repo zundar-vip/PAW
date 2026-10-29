@@ -107,7 +107,7 @@ def txt_welcome(u):
     name = u.get("full_name") or u.get("username") or "Khách"
     return (
         "╔═══════════════════════════╗\n"
-        "║  🔑  <b>Bot bán key paw</b>  🔑  ║\n"
+        "║  🔑  <b>PAWNOVA KEY SHOP</b>  🔑  ║\n"
         "╚═══════════════════════════╝\n\n"
         f"👋 Chào <b>{name}</b>!\n\n"
         f"🆔 ID: <code>{u['user_id']}</code>\n"
@@ -266,7 +266,7 @@ async def _deliver_key(bot, uid, lic, pkg_name, amount):
         f"<code>{lic['key_value']}</code>\n"
         "─────────────────────────\n"
         "🌐 <b>HƯỚNG DẪN:</b>\n"
-        f"1. Mở website: https://pawnovatoolvip.netlify.app/\n"
+        f"1. Mở website: <code>{PAWNOVA_WEB_URL}</code>\n"
         "2. Dán key vào ô nhập → nhấn KÍCH HOẠT\n"
         "3. Key chỉ dùng được trên 1 thiết bị — không chia sẻ"
     )
@@ -426,8 +426,10 @@ async def on_callback(update, ctx):
             await reply(update,
                 "🌐 <b>ĐỊA CHỈ WEBSITE</b>\n"
                 "─────────────────────────\n"
-                f"https://pawnovatoolvip.netlify.app/\n\n"
-                "📱 <b>Bấm giữ để copy</b> rồi dán vào trình duyệt.\n\n")
+                f"<code>{PAWNOVA_WEB_URL}</code>\n\n"
+                "📱 <b>Bấm giữ để copy</b> rồi dán vào trình duyệt.\n\n"
+                "💡 Khi deploy lên domain public (VD <code>https://pawnova.vn</code>), "
+                "link sẽ tự đổi thành nút bấm được.")
         elif sec == "free_key":
             try:
                 member = await ctx.bot.get_chat_member(chat_id="@PAW8386", user_id=user["user_id"])
@@ -657,15 +659,25 @@ _app = None
 
 async def credit_from_webhook(uid, amount, ref, pmt_id):
     pmt = db.get_payment_by_id(pmt_id)
-    db.complete_payment(pmt_id)
-    if not (_app and pmt):
+    if not pmt:
+        log.warning(f"credit_from_webhook: payment not found: {pmt_id}")
         return
-    bot = _app.bot
-    msg_id = pmt.get("message_id", 0) if pmt else 0
+    if not _app:
+        log.error("credit_from_webhook: _app chưa khởi tạo")
+        return
+    # Atomic guard — poll_loop và watch_payment_ref có thể cùng fire
+    # complete_payment chỉ update nếu status='pending', trả False nếu đã xử lý rồi
+    if not db.complete_payment(pmt_id):
+        return
+
+    bot    = _app.bot
+    msg_id = pmt.get("message_id", 0) or 0
 
     if msg_id:
-        try: await bot.delete_message(chat_id=uid, message_id=msg_id)
-        except Exception: pass
+        try:
+            await bot.delete_message(chat_id=uid, message_id=msg_id)
+        except Exception as e:
+            log.warning(f"delete QR msg {msg_id}: {e}")
     if _last_bot_msg.get(uid) == msg_id:
         _last_bot_msg.pop(uid, None)
 
@@ -687,7 +699,7 @@ async def credit_from_webhook(uid, amount, ref, pmt_id):
         try:
             await _deliver_key(bot, uid, lic, pkg_name, amount)
         except Exception as e:
-            log.error(f"deliver: {e}")
+            log.error(f"deliver_key: {e}")
         await _notify_admin_sold(uid, lic, pkg_name, amount, ref, "QR")
         return
 
