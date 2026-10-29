@@ -428,8 +428,6 @@ async def on_callback(update, ctx):
                 "─────────────────────────\n"
                 f"https://pawnovatoolvip.netlify.app/\n\n"
                 "📱 <b>Bấm giữ để copy</b> rồi dán vào trình duyệt.\n\n"
-                "💡 Khi deploy lên domain public (VD <code>https://pawnova.vn</code>), "
-                "link sẽ tự đổi thành nút bấm được.")
         elif sec == "free_key":
             try:
                 member = await ctx.bot.get_chat_member(chat_id="@PAW8386", user_id=user["user_id"])
