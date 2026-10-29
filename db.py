@@ -1,3 +1,4 @@
+# db.py
 import sqlite3
 import uuid
 import secrets
@@ -215,8 +216,9 @@ def all_users(limit=100):
 def new_order(uid, service_id, service_name, amount, extra="", status="pending"):
     oid = f"{ORDER_PREFIX}{datetime.now().strftime('%d%m%H%M')}{uuid.uuid4().hex[:4].upper()}"
     c = _conn()
-    c.execute("INSERT INTO orders(order_id,user_id,service_id,service_name,amount,extra_data,status) VALUES(?,?,?,?,?,?,?)",
-              (oid, uid, service_id, service_name, amount, extra, status))
+    c.execute(
+        "INSERT INTO orders(order_id,user_id,service_id,service_name,amount,extra_data,status) VALUES(?,?,?,?,?,?,?)",
+        (oid, uid, service_id, service_name, amount, extra, status))
     c.execute("UPDATE users SET total_orders=total_orders+1 WHERE user_id=?", (uid,))
     c.commit(); c.close(); return oid
 
