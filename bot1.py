@@ -1,721 +1,416 @@
-import uuid, json, logging, os, asyncio, random, re as _re, time
-from datetime import datetime
+import asyncio
+import logging
+import datetime
+from typing import Optional
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
-from telegram.ext import (Application, CommandHandler, CallbackQueryHandler,
-                          MessageHandler, filters, ContextTypes)
-from telegram.constants import ParseMode
-from telegram import Bot as _TgBot
+import aiohttp
+from aiohttp import web
 
-from config import (BOT1_TOKEN, BOT2_TOKEN, ADMIN_CHAT_ID,
-                    ACCOUNT_NAME as BANK_NAME, ACCOUNT_NO as BANK_ACC,
-                    PAWNOVA_WEB_URL)
-import db, pay, svc, hook
+from config import WEBHOOK_PORT, SEPAY_TOKEN, SEPAY_POLL_INTERVAL, ACCOUNT_NO
+import db
+import pay
 
 log = logging.getLogger(__name__)
-_admin_bot = _TgBot(token=BOT2_TOKEN)
 
-_last_bot_msg = {}
+SEPAY_ENDPOINTS = [
+    ("https://userapi.sepay.vn/v2/transactions", "v2"),
+    ("https://my.sepay.vn/userapi/transactions/list", "userapi"),
+]
 
+_credit_fn = None
+_notify_admin_tx_fn = None
 
-async def _delete_bot_msg(bot, uid):
-    mid = _last_bot_msg.pop(uid, None)
-    if mid:
-        try:
-            await bot.delete_message(uid, mid)
-        except Exception:
-            pass
-
-
-def _is_main_kb(kb):
-    if not kb or not hasattr(kb, 'inline_keyboard'):
-        return False
-    for row in kb.inline_keyboard:
-        for btn in row:
-            if btn.callback_data == "menu:buy_key":
-                return True
-    return False
+_seen_tx_ids: set[str] = set()
+_first_fetch_logged = False
 
 
-def _has_back_to_main(kb):
-    if not kb or not hasattr(kb, 'inline_keyboard'):
-        return False
-    for row in kb.inline_keyboard:
-        for btn in row:
-            if btn.callback_data == "back:main":
-                return True
-    return False
+def set_credit_callback(fn):
+    global _credit_fn
+    _credit_fn = fn
 
 
-def _with_menu(kb):
-    if kb is None:
-        return InlineKeyboardMarkup([[InlineKeyboardButton("🏠 MENU", callback_data="back:main")]])
-    if _is_main_kb(kb) or _has_back_to_main(kb):
-        return kb
-    rows = [list(r) for r in kb.inline_keyboard]
-    rows.append([InlineKeyboardButton("🏠 MENU", callback_data="back:main")])
-    return InlineKeyboardMarkup(rows)
+def set_notify_admin_callback(fn):
+    global _notify_admin_tx_fn
+    _notify_admin_tx_fn = fn
 
 
-def _is_public_url(url: str) -> bool:
-    if not url:
-        return False
-    u = url.strip().lower()
-    if not (u.startswith("http://") or u.startswith("https://")):
-        return False
-    m = _re.search(r"://([^/:?#]+)", u)
-    if not m:
-        return False
-    host = m.group(1)
-    if host in ("localhost", "0.0.0.0") or host.endswith(".localhost"):
-        return False
-    parts = host.split(".")
-    if len(parts) == 4 and all(p.isdigit() for p in parts):
-        a, b = int(parts[0]), int(parts[1])
-        if a == 127: return False
-        if a == 10: return False
-        if a == 169 and b == 254: return False
-        if a == 172 and 16 <= b <= 31: return False
-        if a == 192 and b == 168: return False
-    return True
+async def poll_sepay_loop():
+    log.info(f"SePay polling started — interval={SEPAY_POLL_INTERVAL}s")
+    await _init_seen()
 
-
-async def _send_admin(text):
-    try:
-        await _admin_bot.send_message(ADMIN_CHAT_ID, text, parse_mode=ParseMode.HTML)
-    except Exception as e:
-        log.warning(f"admin notify: {e}")
-
-
-async def notify_admin_tx(amount, desc, user, ref, matched):
-    if matched and user:
-        txt = (f"💰 <b>GIAO DỊCH VÀO</b> ✅\n"
-               f"💵 <b>{pay.fmt(amount)}</b>\n"
-               f"📝 <code>{desc[:120]}</code>\n"
-               f"👤 UID: <code>{user['user_id']}</code> @{user.get('username') or '─'}\n"
-               f"💼 Số dư: <b>{pay.fmt(user['balance'])}</b>")
-    else:
-        txt = (f"💰 <b>GIAO DỊCH VÀO</b> ⚠️\n"
-               f"💵 <b>{pay.fmt(amount)}</b>\n"
-               f"📝 <code>{desc[:120]}</code>\n"
-               f"📌 Ref: <code>{ref or '—'}</code>")
-    await _send_admin(txt)
-
-
-def txt_welcome(u):
-    name = u.get("full_name") or u.get("username") or "Khách"
-    return (
-        "╔═══════════════════════════╗\n"
-        "║  🔑  <b>PAWNOVA KEY SHOP</b>  🔑  ║\n"
-        "╚═══════════════════════════╝\n\n"
-        f"👋 Chào <b>{name}</b>!\n\n"
-        f"🆔 ID: <code>{u['user_id']}</code>\n"
-        f"💰 Số dư: <b>{pay.fmt(u['balance'])}</b>\n"
-        f"📦 Tổng đơn: <b>{u['total_orders']}</b>\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "  <b>VUI LÒNG CHỌN THAO TÁC</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━"
-    )
-
-
-def txt_profile(u):
-    return (
-        "👤 <b>THÔNG TIN TÀI KHOẢN</b>\n"
-        "─────────────────────────\n"
-        f"🆔 ID: <code>{u['user_id']}</code>\n"
-        f"👤 Tên: <b>{u.get('full_name','─')}</b>\n"
-        f"📛 Username: @{u.get('username','─')}\n"
-        f"💰 Số dư: <b>{pay.fmt(u['balance'])}</b>\n"
-        f"📦 Tổng đơn: <b>{u['total_orders']}</b>\n"
-        f"💸 Đã chi: <b>{pay.fmt(u['total_spent'])}</b>"
-    )
-
-
-def txt_qr_payment(amount, ref):
-    return (
-        "╭───────────────────────╮\n"
-        "    💳 <b>THANH TOÁN QR</b>\n"
-        "╰───────────────────────╯\n"
-        f"💰 Số tiền: <b>{pay.fmt(amount)}</b>\n"
-        f"🏦 Ngân hàng: <b>BIDV</b>\n"
-        f"👤 Chủ TK: <b>{BANK_NAME}</b>\n"
-        f"🔢 Số TK: <code>{BANK_ACC}</code>\n"
-        "─────────────────────────\n"
-        "📌 <b>NỘI DUNG CHUYỂN KHOẢN:</b>\n"
-        f"<code>{ref}</code>\n"
-        "─────────────────────────\n"
-        "⏰ Hết hạn sau <b>15 phút</b>\n"
-        "✅ Sau khi chuyển khoản, nhấn <b>🔄 KIỂM TRA THANH TOÁN</b>"
-    )
-
-
-def kb_main():
-    rows = [
-        [InlineKeyboardButton("🔑  MUA KEY",       callback_data="menu:buy_key")],
-        [InlineKeyboardButton("🗝️  KEY CỦA TÔI",   callback_data="menu:my_keys")],
-        [InlineKeyboardButton("🎁  NHẬN KEY FREE", callback_data="menu:free_key")],
-        [InlineKeyboardButton("💳  NẠP TIỀN",      callback_data="menu:topup"),
-         InlineKeyboardButton("👤  TÀI KHOẢN",     callback_data="menu:profile")],
-    ]
-    if _is_public_url(PAWNOVA_WEB_URL):
-        rows.append([InlineKeyboardButton("🌐  MỞ WEBSITE", url=PAWNOVA_WEB_URL)])
-    else:
-        rows.append([InlineKeyboardButton("🌐  XEM LINK WEB", callback_data="menu:show_web")])
-    return InlineKeyboardMarkup(rows)
-
-
-def kb_packages():
-    rows = [[InlineKeyboardButton(f"{p['name']}  ─  {pay.fmt(p['price'])}", callback_data=f"pkg:{pid}")]
-            for pid, p in svc.KEY_PACKAGES.items()]
-    rows.append([InlineKeyboardButton("◀️  QUAY LẠI", callback_data="back:main")])
-    return InlineKeyboardMarkup(rows)
-
-
-def kb_confirm_key(ref):
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ XÁC NHẬN & THANH TOÁN", callback_data=f"confirm_key:{ref}")],
-        [InlineKeyboardButton("◀️ QUAY LẠI", callback_data="back:main")],
-    ])
-
-
-def kb_payment(ref):
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔄 KIỂM TRA THANH TOÁN", callback_data=f"checkpay:{ref}")],
-        [InlineKeyboardButton("❌ HUỶ THANH TOÁN",         callback_data=f"cancelpay:{ref}")],
-    ])
-
-
-def kb_topup():
-    rows, row = [], []
-    for a in [50_000, 100_000, 200_000, 500_000, 1_000_000]:
-        row.append(InlineKeyboardButton(pay.fmt(a), callback_data=f"tamt:{a}"))
-        if len(row) == 3:
-            rows.append(row); row = []
-    if row:
-        rows.append(row)
-    rows += [[InlineKeyboardButton("✏️ NHẬP SỐ KHÁC", callback_data="tamt:custom")],
-             [InlineKeyboardButton("◀️ QUAY LẠI", callback_data="back:main")]]
-    return InlineKeyboardMarkup(rows)
-
-
-def kb_back(t="main"):
-    return InlineKeyboardMarkup([[InlineKeyboardButton("◀️ QUAY LẠI", callback_data=f"back:{t}")]])
-
-
-async def reply(update, text, kb=None, parse_mode=ParseMode.HTML):
-    bot = update.get_bot()
-    uid = update.effective_user.id
-
-    await _delete_bot_msg(bot, uid)
-
-    if update.callback_query:
-        try:
-            await update.callback_query.message.delete()
-        except Exception:
-            pass
-    elif update.message:
-        txt = update.message.text or ""
-        if not txt.startswith("/start"):
+    async with aiohttp.ClientSession() as session:
+        while True:
             try:
-                await update.message.delete()
-            except Exception:
-                pass
-
-    kb = _with_menu(kb)
-    msg = await bot.send_message(uid, text, reply_markup=kb, parse_mode=parse_mode)
-    _last_bot_msg[uid] = msg.message_id
-    return msg
-
-
-async def ensure_user(update):
-    u = update.effective_user
-    user = db.get_user(u.id)
-    if not user:
-        user = db.upsert_user(u.id, u.username or "", u.full_name or "")
-    return user
+                await _poll_once(session)
+            except asyncio.CancelledError:
+                log.info("SePay polling cancelled")
+                return
+            except Exception as e:
+                log.error(f"SePay poll error: {e}", exc_info=True)
+            await asyncio.sleep(SEPAY_POLL_INTERVAL)
 
 
-async def show_main(update, _):
-    user = await ensure_user(update)
-    await reply(update, txt_welcome(user), kb_main())
+async def _init_seen():
+    try:
+        async with aiohttp.ClientSession() as s:
+            txs = await _fetch_transactions(s, limit=50)
+            for tx in txs:
+                _seen_tx_ids.add(str(tx.get("id", "")))
+        log.info(f"SePay: seeded {len(_seen_tx_ids)} known transactions")
+    except Exception as e:
+        log.warning(f"SePay init_seen failed (continuing): {e}")
 
 
-FREE_ROLLS = [(0.60, 0), (0.80, 10), (0.85, 20), (0.90, 25), (0.93, 30), (1.00, 40)]
+async def _fetch_transactions(session: aiohttp.ClientSession, limit: int = 20) -> list[dict]:
+    global _first_fetch_logged
+
+    headers = {
+        "Authorization": f"Bearer {SEPAY_TOKEN.strip()}",
+        "Content-Type":  "application/json",
+        "Accept":        "application/json",
+    }
+
+    for url, tag in SEPAY_ENDPOINTS:
+        params = {"limit": limit}
+        if tag == "userapi":
+            params["account_number"] = ACCOUNT_NO.replace(" ", "")
+
+        try:
+            async with session.get(url, headers=headers, params=params,
+                                   timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                text = await resp.text()
+
+                if resp.status != 200:
+                    log.debug(f"SePay[{tag}] HTTP {resp.status}: {text[:200]}")
+                    continue
+
+                try:
+                    body = await resp.json(content_type=None)
+                except Exception:
+                    log.warning(f"SePay[{tag}] non-JSON: {text[:200]}")
+                    continue
+
+                if not _first_fetch_logged:
+                    log.info(f"SePay[{tag}] first response keys: {list(body.keys()) if isinstance(body, dict) else type(body)}")
+                    if isinstance(body, dict) and body:
+                        for k in ("transactions", "data", "messages"):
+                            v = body.get(k)
+                            if isinstance(v, list) and v:
+                                log.info(f"  └ {k}[0] keys: {list(v[0].keys())}")
+                                break
+                    _first_fetch_logged = True
+
+                txs = _extract_tx_list(body)
+                if txs:
+                    log.debug(f"SePay[{tag}] → {len(txs)} tx")
+                    return txs
+
+                err = body.get("error") if isinstance(body, dict) else None
+                if err not in (None, 0, "0", False, ""):
+                    log.debug(f"SePay[{tag}] error field: {err}")
+
+        except Exception as e:
+            log.debug(f"SePay[{tag}] exception: {e}")
+            continue
+
+    log.warning("SePay: all endpoints returned empty/error")
+    return []
 
 
-def roll_free_key():
-    r = random.random()
-    for thr, minutes in FREE_ROLLS:
-        if r < thr:
-            return minutes
+def _extract_tx_list(body) -> list[dict]:
+    if isinstance(body, list):
+        return body
+    if not isinstance(body, dict):
+        return []
+
+    for path in (
+        ("transactions",),
+        ("data",),
+        ("messages", "transactions"),
+        ("messages", "data"),
+        ("data", "transactions"),
+        ("result", "transactions"),
+        ("result", "data"),
+    ):
+        cur = body
+        ok = True
+        for k in path:
+            if isinstance(cur, dict) and k in cur:
+                cur = cur[k]
+            else:
+                ok = False
+                break
+        if ok and isinstance(cur, list) and cur:
+            return cur
+
+    return []
+
+
+def _tx_amount_in(tx: dict) -> int:
+    for k in ("amount_in", "transferAmount", "credit", "amount"):
+        v = tx.get(k)
+        if v is None:
+            continue
+        try:
+            n = int(v)
+            if n > 0:
+                return n
+        except (TypeError, ValueError):
+            continue
     return 0
 
 
-async def _deliver_key(bot, uid, lic, pkg_name, amount):
-    await _delete_bot_msg(bot, uid)
-
-    text = (
-        "╔═══════════════════════════╗\n"
-        "║  🎉 <b>THANH TOÁN THÀNH CÔNG</b>  ║\n"
-        "╚═══════════════════════════╝\n\n"
-        f"📦 Gói: <b>{pkg_name}</b>\n"
-        f"💵 Số tiền: <b>{pay.fmt(amount)}</b>\n"
-        "─────────────────────────\n"
-        "🔑 <b>KEY CỦA BẠN:</b>\n"
-        f"<code>{lic['key_value']}</code>\n"
-        "─────────────────────────\n"
-        "🌐 <b>HƯỚNG DẪN:</b>\n"
-        f"1. Mở website: <code>{PAWNOVA_WEB_URL}</code>\n"
-        "2. Dán key vào ô nhập → nhấn KÍCH HOẠT\n"
-        "3. Key chỉ dùng được trên 1 thiết bị — không chia sẻ"
-    )
-    msg = await bot.send_message(uid, text, parse_mode=ParseMode.HTML, reply_markup=kb_main())
-    _last_bot_msg[uid] = msg.message_id
-
-
-async def _notify_admin_sold(uid, lic, pkg_name, amount, ref, via):
-    user = db.get_user(uid)
-    uname = (user.get("username") or "─") if user else "─"
-    await _send_admin(
-        f"🔑 <b>KEY ĐÃ BÁN</b> — {via}\n"
-        f"👤 User: @{uname} (<code>{uid}</code>)\n"
-        f"📦 Gói: <b>{pkg_name}</b>\n"
-        f"💵 Giá: <b>{pay.fmt(amount)}</b>\n"
-        f"🔑 Key: <code>{lic['key_value']}</code>\n"
-        f"📌 Ref: <code>{ref}</code>"
+def _tx_content(tx: dict) -> str:
+    return str(
+        tx.get("transaction_content")
+        or tx.get("content")
+        or tx.get("description")
+        or ""
     )
 
 
-async def show_qr_key(update, ctx, amount, order_data):
-    bot = update.get_bot()
-    user = await ensure_user(update)
-    uid = user["user_id"]
+def _tx_ref(tx: dict) -> Optional[str]:
+    ref = pay.parse_ref(_tx_content(tx))
+    if ref:
+        return ref
+    code = str(tx.get("code") or "").strip()
+    if code:
+        return pay.parse_ref(code.upper())
+    return None
 
-    ref = f"KEY{uuid.uuid4().hex[:8].upper()}"
-    qr = pay.qr_url(amount, ref)
-    cap = txt_qr_payment(amount, ref)
-    kb = _with_menu(kb_payment(ref))
 
-    await _delete_bot_msg(bot, uid)
-    if update.callback_query:
-        try: await update.callback_query.message.delete()
-        except Exception: pass
-    elif update.message:
-        try: await update.message.delete()
-        except Exception: pass
+async def _poll_once(session: aiohttp.ClientSession):
+    txs = await _fetch_transactions(session, limit=20)
+    if not txs:
+        return
 
+    new_count = 0
+    for tx in txs:
+        tx_id = str(tx.get("id", ""))
+        if not tx_id or tx_id in _seen_tx_ids:
+            continue
+        _seen_tx_ids.add(tx_id)
+        new_count += 1
+
+        amount_in = _tx_amount_in(tx)
+        if amount_in <= 0:
+            continue
+
+        content = _tx_content(tx)
+        log.info(f"[poll] new tx id={tx_id} amount={amount_in} content={content[:80]!r}")
+        await _process({"amount": amount_in, "description": content}, source="poll")
+
+    if new_count:
+        log.info(f"[poll] processed {new_count} new tx")
+
+
+async def handle_sepay(req: web.Request) -> web.Response:
     try:
-        sent = await bot.send_photo(uid, photo=qr, caption=cap,
-                                     reply_markup=kb, parse_mode=ParseMode.HTML)
+        body = await req.json()
     except Exception:
-        sent = await bot.send_message(uid, cap, reply_markup=kb, parse_mode=ParseMode.HTML)
+        return web.json_response({"success": False}, status=400)
 
-    _last_bot_msg[uid] = sent.message_id
-    db.new_payment(uid, amount, ref, order_data, sent.message_id)
-    asyncio.create_task(hook.watch_payment_ref(ref, uid))
-    await _send_admin(
-        f"🔔 <b>QR CHỜ THANH TOÁN</b>\n"
-        f"👤 UID: <code>{uid}</code>\n"
-        f"📦 Gói: <b>{order_data.get('pkg_name')}</b>\n"
-        f"💵 <b>{pay.fmt(amount)}</b>\n"
-        f"📌 Ref: <code>{ref}</code>"
-    )
+    tx_id = str(body.get("id", ""))
+    if tx_id and tx_id in _seen_tx_ids:
+        return web.json_response({"success": True})
+    if tx_id:
+        _seen_tx_ids.add(tx_id)
+
+    transfer_type = body.get("transferType", "in")
+    if transfer_type != "in":
+        return web.json_response({"success": True})
+
+    amount  = int(body.get("transferAmount") or body.get("credit") or body.get("amount_in") or 0)
+    content = str(body.get("content") or body.get("transaction_content") or "")
+
+    if amount > 0:
+        await _process({"amount": amount, "description": content}, source="webhook")
+
+    return web.json_response({"success": True})
 
 
-async def show_qr_topup(update, ctx, amount):
-    bot = update.get_bot()
-    user = await ensure_user(update)
-    uid = user["user_id"]
+async def health(_: web.Request) -> web.Response:
+    return web.Response(text="OK")
 
-    ref = f"NAPTIEN{uuid.uuid4().hex[:8].upper()}"
-    qr = pay.qr_url(amount, ref)
-    cap = (
-        "💳 <b>NẠP TIỀN VÀO SỐ DƯ</b>\n"
-        f"💰 <b>{pay.fmt(amount)}</b>\n"
-        f"🏦 BIDV · {BANK_NAME}\n"
-        f"🔢 <code>{BANK_ACC}</code>\n\n"
-        f"📌 Nội dung: <code>{ref}</code>\n"
-        "⏰ 15 phút · tự cộng tiền\n"
-        "✅ Sau khi chuyển khoản, nhấn <b>🔄 KIỂM TRA THANH TOÁN</b>"
-    )
-    kb = _with_menu(kb_payment(ref))
 
-    await _delete_bot_msg(bot, uid)
-    if update.callback_query:
-        try: await update.callback_query.message.delete()
-        except Exception: pass
-    elif update.message:
-        try: await update.message.delete()
-        except Exception: pass
+async def _process(rec: dict, source: str = "?"):
+    amount = int(rec.get("amount", 0))
+    desc   = str(rec.get("description", ""))
 
+    if amount <= 0:
+        return
+
+    ref = pay.parse_ref(desc)
+    pmt = db.get_payment_by_ref(ref) if ref else None
+    uid = pmt["user_id"] if pmt else None
+    user = db.get_user(uid) if uid else None
+    matched = (pmt is not None and pmt.get("status") == "pending")
+
+    if _notify_admin_tx_fn:
+        try:
+            await _notify_admin_tx_fn(amount, desc, user, ref, matched)
+        except Exception as e:
+            log.error(f"notify_admin_tx error: {e}")
+
+    if not ref:
+        log.debug(f"[{source}] No ref in: {desc!r}")
+        return
+    if not pmt:
+        log.debug(f"[{source}] No pending payment for ref={ref}")
+        return
+    if pmt["status"] != "pending":
+        log.debug(f"[{source}] Already processed: {ref}")
+        return
+
+    expected = pmt["amount"]
+    if amount < expected:
+        log.warning(f"[{source}] Underpayment: ref={ref} expected={expected} got={amount}")
+
+    log.info(f"[{source}] ✅ Payment confirmed: ref={ref} uid={uid} amount={amount}")
+
+    if _credit_fn:
+        await _credit_fn(uid, amount, ref, pmt["payment_id"])
+
+
+async def check_payment_now(ref: str, limit: int = 30) -> dict:
     try:
-        sent = await bot.send_photo(uid, photo=qr, caption=cap,
-                                     reply_markup=kb, parse_mode=ParseMode.HTML)
-    except Exception:
-        sent = await bot.send_message(uid, cap, reply_markup=kb, parse_mode=ParseMode.HTML)
-
-    _last_bot_msg[uid] = sent.message_id
-    db.new_payment(uid, amount, ref, {}, sent.message_id)
-    asyncio.create_task(hook.watch_payment_ref(ref, uid))
-
-
-async def cmd_start(update, ctx):
-    user = await ensure_user(update)
-    if user.get("is_banned"):
-        await update.message.reply_text("⛔ Tài khoản đã bị khoá.")
-        return
-
-    uid = user["user_id"]
-    bot = ctx.bot
-
-    await _delete_bot_msg(bot, uid)
-
-    msg = await bot.send_message(uid, txt_welcome(user),
-                                  reply_markup=kb_main(), parse_mode=ParseMode.HTML)
-    _last_bot_msg[uid] = msg.message_id
-
-
-async def cmd_balance(update, ctx):
-    user = await ensure_user(update)
-    await reply(update, f"💰 Số dư: <b>{pay.fmt(user['balance'])}</b>")
-
-
-async def cmd_mykeys(update, ctx):
-    user = await ensure_user(update)
-    lic = [x for x in db.list_licenses(q=str(user["user_id"]))
-           if int(x.get("telegram_id") or 0) == user["user_id"]]
-    if not lic:
-        await reply(update, "🗝️ Bạn chưa có key nào.")
-        return
-    txt = "🗝️ <b>KEY CỦA BẠN</b>\n\n"
-    for k in lic[:10]:
-        hsd = k.get("expires_at") or "Chưa kích hoạt"
-        txt += (f"🔑 <code>{k['key_value']}</code>\n"
-                f"   📦 {k.get('package_name') or 'Custom'}\n"
-                f"   ⏰ {hsd}\n\n")
-    await reply(update, txt)
-
-
-async def on_callback(update, ctx):
-    q = update.callback_query
-    await q.answer()
-    data = q.data
-    user = await ensure_user(update)
-
-    if user.get("is_banned"):
-        await q.answer("⛔ Tài khoản bị khoá!", show_alert=True)
-        return
-
-    if data.startswith("back:"):
-        if data[5:] == "main":
-            await show_main(update, ctx)
-        return
-
-    if data.startswith("menu:"):
-        sec = data[5:]
-        if sec == "buy_key":
-            await reply(update, "🔑 <b>CHỌN GÓI KEY</b>\n\nChọn gói phù hợp:", kb_packages())
-        elif sec == "my_keys":
-            await cmd_mykeys(update, ctx)
-        elif sec == "topup":
-            await reply(update, "💳 <b>NẠP TIỀN</b>\n\nChọn mệnh giá:", kb_topup())
-        elif sec == "profile":
-            await reply(update, txt_profile(user))
-        elif sec == "show_web":
-            await reply(update,
-                "🌐 <b>ĐỊA CHỈ WEBSITE</b>\n"
-                "─────────────────────────\n"
-                f"<code>{PAWNOVA_WEB_URL}</code>\n\n"
-                "📱 <b>Bấm giữ để copy</b> rồi dán vào trình duyệt.\n\n"
-                "💡 Khi deploy lên domain public (VD <code>https://pawnova.vn</code>), "
-                "link sẽ tự đổi thành nút bấm được.")
-        elif sec == "free_key":
-            try:
-                member = await ctx.bot.get_chat_member(chat_id="@PAW8386", user_id=user["user_id"])
-                is_joined = member.status in ['member', 'administrator', 'creator']
-            except Exception as e:
-                log.warning(f"check join error: {e}")
-                is_joined = False
-
-            if not is_joined:
-                kb = InlineKeyboardMarkup([
-                    [InlineKeyboardButton("1️⃣ THAM GIA GROUP", url="https://t.me/PAW8386")],
-                    [InlineKeyboardButton("2️⃣ CHECK ĐÃ THAM GIA", callback_data="menu:free_key")],
-                    [InlineKeyboardButton("◀️ QUAY LẠI", callback_data="back:main")]
-                ])
-                await reply(update, "⚠️ <b>BẠN CHƯA THAM GIA GROUP</b>\n\nVui lòng tham gia group https://t.me/PAW8386 để nhận key free!", kb)
-                return
-
-            ctx.user_data["await"] = "free_key_proofs"
-            ctx.user_data["proof_ids"] = []
-
-            caption = "MỌI NGƯỜI CẦN ĐẶT MUA KEY SỬ DỤNG TOOL ,  KEY FREE THEO THỜI HẠN THÌ VÀO BOT @PawBanKey_bot VÀ THAM GIA GROUP https://t.me/PAW8386 ĐỂ ĐƯỢC THAM GIA CÁC EVENT NHẬN THƯỞNG HÀNG TUẦN + PHÁT CODE GAME TX"
-
-            base_dir = os.path.dirname(os.path.abspath(__file__))
-            anh1 = os.path.join(base_dir, "NHIEMVU", "ANH1.jpg")
-            anh2 = os.path.join(base_dir, "NHIEMVU", "ANH2.jpg")
-
-            try:
-                media_group = [
-                    InputMediaPhoto(media=open(anh1, 'rb'), caption=caption),
-                    InputMediaPhoto(media=open(anh2, 'rb'))
-                ]
-                await ctx.bot.send_media_group(chat_id=user["user_id"], media=media_group)
-
-                await reply(update, "📸 <b>HƯỚNG DẪN NHẬN KEY:</b>\n\n1. Gửi 2 ảnh trên kèm nội dung vào 5 group (trên 1k thành viên).\n2. Chụp màn hình (screenshot) các bài đăng đó gửi lại vào đây.\n\nGửi đủ 5 ảnh khác nhau để nhận key!", kb_back("main"))
-            except FileNotFoundError:
-                await reply(update, "❌ <b>LỖI:</b> Không tìm thấy file ảnh trong thư mục NHIEMVU.")
-            return
-        return
-
-    if data.startswith("pkg:"):
-        pid = data[4:]
-        p = svc.KEY_PACKAGES.get(pid)
-        if not p:
-            await q.answer("Gói không tồn tại!", show_alert=True)
-            return
-        ref = f"KEY{uuid.uuid4().hex[:8].upper()}"
-        ctx.user_data["key_pending"] = {"ref": ref, "pkg_id": pid, "pkg_name": p["name"],
-                                        "price": p["price"], "hours": p["hours"]}
-        bal = user["balance"]
-        can = bal >= p["price"]
-        status = ("✅ <b>Số dư đủ — trừ trực tiếp</b>" if can
-                  else f"⚠️ <b>Thiếu {pay.fmt(p['price']-bal)} → thanh toán QR</b>")
-        txt = (
-            "📋 <b>XÁC NHẬN MUA KEY</b>\n"
-            f"📦 <b>{p['name']}</b>\n"
-            f"💵 <b>{pay.fmt(p['price'])}</b>\n"
-            f"⏰ <b>{p['hours']} giờ</b>\n"
-            f"💼 Số dư: <b>{pay.fmt(bal)}</b>\n\n{status}"
-        )
-        await reply(update, txt, kb_confirm_key(ref))
-        return
-
-    if data.startswith("confirm_key:"):
-        ref = data[12:]
-        pend = ctx.user_data.get("key_pending")
-        if not pend or pend.get("ref") != ref:
-            await q.answer("Phiên hết hạn, chọn lại!", show_alert=True)
-            return
-        pid = pend["pkg_id"]; pkg_name = pend["pkg_name"]
-        price = pend["price"]; hours = pend["hours"]
-        
-        if not db.deduct(user["user_id"], price, ref_id=ref, desc=f"Mua {pkg_name}"):
-            await show_qr_key(update, ctx, price,
-                              {"pkg_id": pid, "pkg_name": pkg_name, "hours": hours})
-            return
-            
-        try:
-            lic = db.create_license(label=f"Bot · {user.get('username') or user['user_id']}",
-                                    hours=hours, telegram_id=user["user_id"],
-                                    package_id=pid, package_name=pkg_name)
-            db.new_order(user["user_id"], pid, pkg_name, price, lic["key_value"], status="completed")
-        except Exception as e:
-            log.error(f"confirm_key error: {e}")
-            db.credit(user["user_id"], price, ref_id=ref, desc=f"Hoàn tiền lỗi mua {pkg_name}")
-            await reply(update, "❌ Có lỗi xảy ra khi tạo key. Đã hoàn lại tiền vào số dư. Vui lòng thử lại!")
-            return
-
-        ctx.user_data.pop("key_pending", None)
-        await _deliver_key(ctx.bot, user["user_id"], lic, pkg_name, price)
-        await _notify_admin_sold(user["user_id"], lic, pkg_name, price, ref, "Số dư")
-        return
-
-    if data.startswith("checkpay:"):
-        ref = data[9:]
-        now_ts = time.time()
-        last = ctx.user_data.get("last_check_ts", 0)
-        if now_ts - last < 3:
-            await q.answer("⏳ Vui lòng chờ 3 giây rồi thử lại", show_alert=True)
-            return
-        ctx.user_data["last_check_ts"] = now_ts
-
-        pmt = db.get_payment_by_ref(ref)
-        if not pmt:
-            try:
-                c = db._conn()
-                row = c.execute(
-                    "SELECT status FROM pending_payments WHERE order_ref=?",
-                    (ref,)).fetchone()
-                c.close()
-            except Exception:
-                row = None
-            if row and row["status"] == "completed":
-                await q.answer("✅ Đơn đã hoàn tất, key đã gửi!", show_alert=True)
-            elif row and row["status"] == "expired":
-                await q.answer("⏰ QR đã hết hạn (15 phút). Vui lòng tạo đơn mới.", show_alert=True)
-            else:
-                await q.answer("❌ Không tìm thấy đơn", show_alert=True)
-            await show_main(update, ctx)
-            return
-
-        try:
-            res = await hook.check_payment_now(ref)
-        except Exception as e:
-            log.error(f"checkpay callback: {e}")
-            await q.answer("⚠️ Lỗi kết nối ngân hàng, thử lại sau", show_alert=True)
-            return
-
-        if res.get("found"):
-            await q.answer("✅ ĐÃ NHẬN THANH TOÁN — Key đang được gửi!", show_alert=True)
-            return
-
-        reason = res.get("reason", "not_yet")
-        if reason == "fetch_error":
-            await q.answer(
-                "⚠️ Không kết nối được cổng ngân hàng.\nThử lại sau 10-20s.",
-                show_alert=True)
-        elif reason == "expired":
-            await q.answer("⏰ QR đã hết hạn. Vui lòng tạo đơn mới.", show_alert=True)
-        else:
-            await q.answer(
-                "⏳ Chưa thấy giao dịch.\n\n"
-                "✔ Kiểm tra ĐÚNG số tiền?\n"
-                "✔ Kiểm tra ĐÚNG nội dung CK (đủ mã)?\n"
-                "✔ Đã chuyển khoản chưa?\n\n"
-                "Ngân hàng có thể trễ 5-30s. Thử lại sau 10-20s.",
-                show_alert=True)
-        return
-
-    if data.startswith("cancelpay:"):
-        pmt = db.get_payment_by_ref(data[10:])
-        if pmt:
-            db.expire_payment(pmt["payment_id"])
-        await reply(update, "❌ Đã huỷ thanh toán.", kb_main())
-        return
-
-    if data.startswith("tamt:"):
-        val = data[5:]
-        if val == "custom":
-            ctx.user_data["await"] = "topup_custom"
-            await reply(update,
-                "✏️ <b>NHẬP SỐ TIỀN</b>\n\nTối thiểu: <b>10.000đ</b>\nVD: 150000 hoặc 150K",
-                kb_back("main"))
-            return
-        await show_qr_topup(update, ctx, int(val))
-        return
-
-
-async def on_message(update, ctx):
-    state = ctx.user_data.get("await")
-
-    if not state:
-        await show_main(update, ctx)
-        return
-
-    if state == "free_key_proofs":
-        if update.message.photo:
-            photo_id = update.message.photo[-1].file_unique_id
-            if db.add_free_key_proof(photo_id, update.effective_user.id):
-                ctx.user_data.setdefault("proof_ids", []).append(photo_id)
-                count = len(ctx.user_data["proof_ids"])
-                if count >= 5:
-                    if not db.can_get_free_key(update.effective_user.id):
-                        await reply(update, "🕐 <b>HÔM NAY BẠN ĐÃ NHẬN KEY FREE RỒI</b>\n\nQuay lại vào ngày mai nhé!")
-                        ctx.user_data["await"] = None
-                        return
-
-                    minutes = roll_free_key()
-                    if minutes == 0: minutes = 15
-                    lic = db.create_license(label=f"Free NV {minutes}p · {update.effective_user.username or update.effective_user.id}", minutes=minutes, telegram_id=update.effective_user.id)
-                    db.log_free_key(update.effective_user.id, f"win:{minutes}")
-                    await reply(update, f"🎉 <b>CHÚC MỪNG BẠN!</b>\n═════════════════════════════\n🎁 Bạn nhận được: <b>KEY {minutes} PHÚT</b>\n═════════════════════════════\n🔑 <code>{lic['key_value']}</code>\n\n🌐 Mở: <code>{PAWNOVA_WEB_URL}</code>")
-                    ctx.user_data["await"] = None
-                else:
-                    await reply(update, f"✅ Đã nhận ảnh {count}/5. Hãy gửi thêm {5-count} ảnh (chụp ở các group khác nhau) để nhận key!")
-            else:
-                await reply(update, "❌ Ảnh này đã được sử dụng hoặc trùng lặp. Vui lòng gửi ảnh khác!")
-        else:
-            await reply(update, "⚠️ Vui lòng gửi ảnh (screenshot) làm minh chứng.")
-        return
-
-    text = update.message.text.strip()
-
-    def clean(s):
-        return s.replace(".", "").replace(",", "").replace("k", "000").replace("K", "000")
-
-    if state == "topup_custom":
-        c = clean(text)
-        if not c.isdigit():
-            await reply(update, "❌ Nhập số tiền hợp lệ!")
-            return
-        amt = int(c)
-        if amt < 10_000:
-            await reply(update, "❌ Tối thiểu <b>10.000đ</b>!")
-            return
-        ctx.user_data["await"] = None
-        await show_qr_topup(update, ctx, amt)
-        return
-
-    await show_main(update, ctx)
-
-
-_app = None
-
-
-async def credit_from_webhook(uid, amount, ref, pmt_id):
-    pmt = db.get_payment_by_id(pmt_id)
-    db.complete_payment(pmt_id)
-    if not (_app and pmt):
-        return
-    bot = _app.bot
-    msg_id = pmt.get("message_id", 0) if pmt else 0
-
-    if msg_id:
-        try: await bot.delete_message(chat_id=uid, message_id=msg_id)
-        except Exception: pass
-    if _last_bot_msg.get(uid) == msg_id:
-        _last_bot_msg.pop(uid, None)
-
-    if ref.startswith("KEY"):
-        try:
-            raw = pmt.get("order_data", "{}")
-            od = json.loads(raw) if isinstance(raw, str) else raw
-        except Exception:
-            od = {}
-        pkg_id   = od.get("pkg_id", "key_1d")
-        pkg_name = od.get("pkg_name", "Key")
-        hours    = int(od.get("hours", 24))
-        lic = db.create_license(label=f"Bot QR · {uid}", hours=hours,
-                                telegram_id=uid, package_id=pkg_id, package_name=pkg_name)
-        db.new_order(uid, pkg_id, pkg_name, amount, lic["key_value"], status="completed")
-        try:
-            await _deliver_key(bot, uid, lic, pkg_name, amount)
-        except Exception as e:
-            log.error(f"deliver: {e}")
-        await _notify_admin_sold(uid, lic, pkg_name, amount, ref, "QR")
-        return
-
-    db.credit(uid, amount, ref_id=ref, desc="Nạp tiền QR")
-    user = db.get_user(uid)
-    if not user:
-        return
-    try:
-        msg = await bot.send_message(uid,
-            f"✅ <b>NẠP TIỀN THÀNH CÔNG</b>\n"
-            f"💰 <b>{pay.fmt(amount)}</b>\n"
-            f"💼 Số dư mới: <b>{pay.fmt(user['balance'])}</b>",
-            parse_mode=ParseMode.HTML, reply_markup=kb_main())
-        _last_bot_msg[uid] = msg.message_id
+        c = db._conn()
+        row = c.execute("SELECT status FROM pending_payments WHERE order_ref=?", (ref,)).fetchone()
+        c.close()
+        if row:
+            if row["status"] == "completed":
+                return {"found": True, "reason": "already_completed"}
+            elif row["status"] == "expired":
+                return {"found": False, "reason": "expired"}
     except Exception:
         pass
-    await _send_admin(f"✅ <b>NẠP TIỀN</b>\nUID <code>{uid}</code> · {pay.fmt(amount)}\n"
-                      f"Số dư: <b>{pay.fmt(user['balance'])}</b>")
+
+    pmt = db.get_payment_by_ref(ref)
+    if not pmt:
+        return {"found": False, "reason": "not_found"}
+
+    if pmt.get("expires_at"):
+        try:
+            if datetime.datetime.now() > datetime.datetime.fromisoformat(pmt["expires_at"]):
+                return {"found": False, "reason": "expired"}
+        except Exception:
+            pass
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            txs = await _fetch_transactions(session, limit=limit)
+        
+        for tx in txs:
+            if _tx_ref(tx) != ref:
+                continue
+            amount = _tx_amount_in(tx)
+            if amount <= 0:
+                continue
+            
+            tx_id = str(tx.get("id", ""))
+            _seen_tx_ids.add(tx_id)
+            
+            log.info(f"[manual_check] matched tx_id={tx_id} ref={ref}")
+            await _process({"amount": amount, "description": _tx_content(tx)}, source="manual_check")
+            return {"found": True, "reason": "success"}
+            
+    except Exception as e:
+        log.error(f"check_payment_now error: {e}")
+        return {"found": False, "reason": "fetch_error"}
+
+    return {"found": False, "reason": "not_yet"}
 
 
-async def _error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE):
-    log.error(f"Handler error: {ctx.error}", exc_info=ctx.error)
+async def watch_payment_ref(ref: str, uid: int,
+                            poll_interval: int = 5,
+                            timeout_secs: int = 900):
+    deadline = asyncio.get_event_loop().time() + timeout_secs
+    await asyncio.sleep(3)
+
+    async with aiohttp.ClientSession() as session:
+        while True:
+            if asyncio.get_event_loop().time() > deadline:
+                log.debug(f"watch_payment_ref: timeout ref={ref}")
+                return
+
+            if db.get_payment_by_ref(ref) is None:
+                return
+
+            try:
+                txs = await _fetch_transactions(session, limit=20)
+                for tx in txs:
+                    if _tx_ref(tx) != ref:
+                        continue
+                    amount = _tx_amount_in(tx)
+                    if amount <= 0:
+                        continue
+                    tx_id = str(tx.get("id", ""))
+                    _seen_tx_ids.add(tx_id)
+                    log.info(f"watch_payment_ref: matched tx_id={tx_id} ref={ref}")
+                    await _process({"amount": amount, "description": _tx_content(tx)},
+                                   source="watch")
+                    return
+
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                log.warning(f"watch_payment_ref poll error ref={ref}: {e}")
+
+            await asyncio.sleep(poll_interval)
 
 
-def build_app():
-    global _app
-    app = Application.builder().token(BOT1_TOKEN).build()
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("balance", cmd_balance))
-    app.add_handler(CommandHandler("mykeys", cmd_mykeys))
-    app.add_handler(CallbackQueryHandler(on_callback))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
-    app.add_handler(MessageHandler(filters.PHOTO, on_message))
-    app.add_error_handler(_error_handler)
-    _app = app
+async def _handle_expired(bot, pmt: dict, kb_main_fn):
+    fresh = db.get_payment_by_id(pmt["payment_id"])
+    if fresh and fresh.get("status") == "completed":
+        log.info(f"skip expired notify: {pmt['payment_id']} already completed")
+        return
+
+    uid    = pmt["user_id"]
+    msg_id = pmt.get("message_id", 0)
+
+    if msg_id:
+        try:
+            await bot.delete_message(chat_id=uid, message_id=msg_id)
+        except Exception:
+            pass
+
+    user = db.get_user(uid)
+    if user:
+        name = user.get("full_name") or user.get("username") or "Khách"
+        welcome = (
+            "⏰ <b>QR CODE ĐÃ HẾT HẠN</b>\n"
+            "─────────────────────────────\n"
+            "Mã QR hết hạn không có giao dịch.\n\n"
+            f"👋 Chào <b>{name}</b>!\n\n"
+            f"🆔 ID: <code>{uid}</code>\n"
+            f"💰 Số dư: <b>{pay.fmt(user['balance'])}</b>\n\n"
+            "⬇️ Chọn thao tác bên dưới:"
+        )
+    else:
+        welcome = "⏰ <b>QR CODE ĐÃ HẾT HẠN</b>\n\nVui lòng chọn lại."
+
+    try:
+        await bot.send_message(uid, welcome, parse_mode="HTML", reply_markup=kb_main_fn())
+    except Exception as e:
+        log.warning(f"expire menu uid={uid}: {e}")
+
+
+async def expire_qr_loop(bot, kb_main_fn):
+    while True:
+        await asyncio.sleep(60)
+        try:
+            expired = db.get_expired_payments()
+            for pmt in expired:
+                db.expire_payment(pmt["payment_id"])
+                asyncio.create_task(_handle_expired(bot, pmt, kb_main_fn))
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            log.error(f"expire loop: {e}")
+
+
+def build_server() -> web.Application:
+    app = web.Application()
+    app.router.add_post("/webhook/sepay", handle_sepay)
+    app.router.add_get("/health",         health)
     return app
