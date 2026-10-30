@@ -1,4 +1,3 @@
-# db.py
 import sqlite3
 import uuid
 import secrets
@@ -277,11 +276,33 @@ def get_payment_by_id(pid):
 
 
 def complete_payment(pid):
-    c = _conn(); c.execute("UPDATE pending_payments SET status='completed' WHERE payment_id=?", (pid,)); c.commit(); c.close()
+    c = _conn()
+    try:
+        cur = c.execute(
+            "UPDATE pending_payments SET status='completed' "
+            "WHERE payment_id=? AND status='pending'",
+            (pid,)
+        )
+        changed = cur.rowcount > 0
+        c.commit()
+        return changed
+    finally:
+        c.close()
 
 
 def expire_payment(pid):
-    c = _conn(); c.execute("UPDATE pending_payments SET status='expired' WHERE payment_id=?", (pid,)); c.commit(); c.close()
+    c = _conn()
+    try:
+        cur = c.execute(
+            "UPDATE pending_payments SET status='expired' "
+            "WHERE payment_id=? AND status='pending'",
+            (pid,)
+        )
+        changed = cur.rowcount > 0
+        c.commit()
+        return changed
+    finally:
+        c.close()
 
 
 def get_expired_payments():
