@@ -14,8 +14,8 @@ SEPAY_QR_TEMPLATE   = "compact"
 SEPAY_POLL_INTERVAL = 10
 
 # ── Bots / Admin ──────────────────────────────────────────
-SEED_ADMIN_IDS: list[int] = [7125723417, 7718105775]
-ADMIN_CHAT_ID: int = 7125723417
+SEED_ADMIN_IDS: list[int] = [7125723417, 8217369095]
+ADMIN_CHAT_ID: int = 8217369095
 PAYMENT_EXPIRY_MINS = 15
 
 # ── DB / Web ──────────────────────────────────────────────
