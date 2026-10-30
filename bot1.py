@@ -1,4 +1,3 @@
-# bot1.py — PAWNOVA KEY SHOP
 import uuid, json, logging, os, asyncio, random, re as _re, time
 from datetime import datetime
 
@@ -266,7 +265,7 @@ async def _deliver_key(bot, uid, lic, pkg_name, amount):
         f"<code>{lic['key_value']}</code>\n"
         "─────────────────────────\n"
         "🌐 <b>HƯỚNG DẪN:</b>\n"
-        f"1. Mở website: <code>{PAWNOVA_WEB_URL}</code>\n"
+        f"1. Mở website: https://pawnovatoolvip.netlify.app/\n"
         "2. Dán key vào ô nhập → nhấn KÍCH HOẠT\n"
         "3. Key chỉ dùng được trên 1 thiết bị — không chia sẻ"
     )
@@ -426,10 +425,8 @@ async def on_callback(update, ctx):
             await reply(update,
                 "🌐 <b>ĐỊA CHỈ WEBSITE</b>\n"
                 "─────────────────────────\n"
-                f"<code>{PAWNOVA_WEB_URL}</code>\n\n"
-                "📱 <b>Bấm giữ để copy</b> rồi dán vào trình duyệt.\n\n"
-                "💡 Khi deploy lên domain public (VD <code>https://pawnova.vn</code>), "
-                "link sẽ tự đổi thành nút bấm được.")
+                f"https://pawnovatoolvip.netlify.app/\n\n"
+                "📱 <b>Bấm giữ để copy</b> rồi dán vào trình duyệt.\n\n")
         elif sec == "free_key":
             try:
                 member = await ctx.bot.get_chat_member(chat_id="@PAW8386", user_id=user["user_id"])
@@ -500,12 +497,12 @@ async def on_callback(update, ctx):
             return
         pid = pend["pkg_id"]; pkg_name = pend["pkg_name"]
         price = pend["price"]; hours = pend["hours"]
-        
+
         if not db.deduct(user["user_id"], price, ref_id=ref, desc=f"Mua {pkg_name}"):
             await show_qr_key(update, ctx, price,
                               {"pkg_id": pid, "pkg_name": pkg_name, "hours": hours})
             return
-            
+
         try:
             lic = db.create_license(label=f"Bot · {user.get('username') or user['user_id']}",
                                     hours=hours, telegram_id=user["user_id"],
@@ -665,13 +662,14 @@ async def credit_from_webhook(uid, amount, ref, pmt_id):
     if not _app:
         log.error("credit_from_webhook: _app chưa khởi tạo")
         return
-    # Atomic guard — poll_loop và watch_payment_ref có thể cùng fire
-    # complete_payment chỉ update nếu status='pending', trả False nếu đã xử lý rồi
+
     if not db.complete_payment(pmt_id):
+        log.info(f"credit_from_webhook: skip (đã xử lý) ref={ref}")
         return
 
-    bot    = _app.bot
+    bot = _app.bot
     msg_id = pmt.get("message_id", 0) or 0
+    expected = int(pmt.get("amount", 0) or 0)
 
     if msg_id:
         try:
@@ -681,43 +679,120 @@ async def credit_from_webhook(uid, amount, ref, pmt_id):
     if _last_bot_msg.get(uid) == msg_id:
         _last_bot_msg.pop(uid, None)
 
+    if expected and amount < expected:
+        log.warning(f"[UNDERPAY] ref={ref} expected={expected} got={amount}")
+        await _send_admin(
+            f"⚠️ <b>THANH TOÁN THIẾU — KHÔNG GIAO KEY</b>\n"
+            f"─────────────────────────\n"
+            f"👤 UID: <code>{uid}</code>\n"
+            f"📌 Ref: <code>{ref}</code>\n"
+            f"💵 Cần: <b>{pay.fmt(expected)}</b>\n"
+            f"💵 Nhận: <b>{pay.fmt(amount)}</b>\n"
+            f"➡️ <i>Admin xử lý tay (gửi key hoặc hoàn tiền).</i>"
+        )
+        try:
+            await bot.send_message(
+                uid,
+                f"⚠️ <b>THANH TOÁN CHƯA ĐỦ</b>\n"
+                f"📌 Ref: <code>{ref}</code>\n"
+                f"💵 Cần: <b>{pay.fmt(expected)}</b>\n"
+                f"💵 Nhận: <b>{pay.fmt(amount)}</b>\n\n"
+                "Vui lòng liên hệ admin để được hỗ trợ.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_main()
+            )
+        except Exception:
+            pass
+        return
+
     if ref.startswith("KEY"):
         try:
             raw = pmt.get("order_data", "{}")
-            od = json.loads(raw) if isinstance(raw, str) else raw
+            od = json.loads(raw) if isinstance(raw, str) else (raw or {})
         except Exception:
             od = {}
         pkg_id   = od.get("pkg_id", "key_1d")
         pkg_name = od.get("pkg_name", "Key")
         hours    = int(od.get("hours", 24))
-        lic = db.create_license(label=f"Bot QR · {uid}", hours=hours,
-                                telegram_id=uid, package_id=pkg_id, package_name=pkg_name)
+
         try:
-            db.new_order(uid, pkg_id, pkg_name, amount, lic["key_value"], status="completed")
+            lic = db.create_license(
+                label=f"Bot QR · {uid}",
+                hours=hours,
+                telegram_id=uid,
+                package_id=pkg_id,
+                package_name=pkg_name,
+            )
         except Exception as e:
-            log.error(f"new_order failed (key vẫn giao): {e}")
+            log.error(f"create_license (webhook) uid={uid}: {e}")
+            await _send_admin(
+                f"🔥 <b>TẠO KEY LỖI — CẦN XỬ LÝ TAY</b>\n"
+                f"👤 UID: <code>{uid}</code>\n"
+                f"📌 Ref: <code>{ref}</code>\n"
+                f"💵 Đã nhận: <b>{pay.fmt(amount)}</b>\n"
+                f"📦 Gói: {pkg_name} ({hours}h)\n"
+                f"🐞 Lỗi: {e}"
+            )
+            try:
+                await bot.send_message(
+                    uid,
+                    f"⚠️ Hệ thống gặp lỗi khi tạo key.\n"
+                    f"📌 Ref: <code>{ref}</code>\n"
+                    "Admin đã được thông báo, sẽ gửi key cho bạn trong vài phút.",
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception:
+                pass
+            return
+
+        try:
+            db.new_order(uid, pkg_id, pkg_name, amount,
+                         lic["key_value"], status="completed")
+        except Exception as e:
+            log.error(f"new_order (webhook) key vẫn giao: {e}")
+
         try:
             await _deliver_key(bot, uid, lic, pkg_name, amount)
         except Exception as e:
-            log.error(f"deliver_key: {e}")
+            log.error(f"deliver_key uid={uid}: {e}")
+            await _send_admin(
+                f"🔥 <b>GỬI KEY LỖI</b>\nUID <code>{uid}</code> ref <code>{ref}</code>\n"
+                f"🔑 Key: <code>{lic['key_value']}</code>\n🐞 {e}"
+            )
+
         await _notify_admin_sold(uid, lic, pkg_name, amount, ref, "QR")
         return
 
-    db.credit(uid, amount, ref_id=ref, desc="Nạp tiền QR")
+    try:
+        db.credit(uid, amount, ref_id=ref, desc="Nạp tiền QR")
+    except Exception as e:
+        log.error(f"credit (topup) uid={uid}: {e}")
+        await _send_admin(
+            f"🔥 <b>CỘNG TIỀN LỖI</b>\nUID <code>{uid}</code> ref <code>{ref}</code>\n"
+            f"💵 {pay.fmt(amount)}\n🐞 {e}"
+        )
+        return
+
     user = db.get_user(uid)
     if not user:
         return
     try:
-        msg = await bot.send_message(uid,
+        msg = await bot.send_message(
+            uid,
             f"✅ <b>NẠP TIỀN THÀNH CÔNG</b>\n"
             f"💰 <b>{pay.fmt(amount)}</b>\n"
             f"💼 Số dư mới: <b>{pay.fmt(user['balance'])}</b>",
-            parse_mode=ParseMode.HTML, reply_markup=kb_main())
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_main(),
+        )
         _last_bot_msg[uid] = msg.message_id
     except Exception:
         pass
-    await _send_admin(f"✅ <b>NẠP TIỀN</b>\nUID <code>{uid}</code> · {pay.fmt(amount)}\n"
-                      f"Số dư: <b>{pay.fmt(user['balance'])}</b>")
+
+    await _send_admin(
+        f"✅ <b>NẠP TIỀN</b>\nUID <code>{uid}</code> · {pay.fmt(amount)}\n"
+        f"Số dư: <b>{pay.fmt(user['balance'])}</b>"
+    )
 
 
 async def _error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE):
