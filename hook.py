@@ -299,24 +299,24 @@ async def check_payment_now(ref: str, limit: int = 30) -> dict:
     try:
         async with aiohttp.ClientSession() as session:
             txs = await _fetch_transactions(session, limit=limit)
-        
-        for tx in txs:
-            if _tx_ref(tx) != ref:
-                continue
-            amount = _tx_amount_in(tx)
-            if amount <= 0:
-                continue
-            
-            tx_id = str(tx.get("id", ""))
-            _seen_tx_ids.add(tx_id)
-            
-            log.info(f"[manual_check] matched tx_id={tx_id} ref={ref}")
-            await _process({"amount": amount, "description": _tx_content(tx)}, source="manual_check")
-            return {"found": True, "reason": "success"}
-            
     except Exception as e:
-        log.error(f"check_payment_now error: {e}")
+        log.error(f"check_payment_now fetch: {e}")
         return {"found": False, "reason": "fetch_error"}
+
+    if not txs:
+        return {"found": False, "reason": "not_yet"}
+
+    for tx in txs:
+        if _tx_ref(tx) != ref:
+            continue
+        amount = _tx_amount_in(tx)
+        if amount <= 0:
+            continue
+        tx_id = str(tx.get("id", ""))
+        _seen_tx_ids.add(tx_id)
+        log.info(f"[manual_check] matched tx_id={tx_id} ref={ref}")
+        await _process({"amount": amount, "description": _tx_content(tx)}, source="manual_check")
+        return {"found": True, "reason": "success"}
 
     return {"found": False, "reason": "not_yet"}
 
@@ -381,7 +381,6 @@ async def _handle_expired(bot, pmt: dict, kb_main_fn):
             "⏰ <b>QR CODE ĐÃ HẾT HẠN</b>\n"
             "─────────────────────────────\n"
             "Mã QR hết hạn không có giao dịch.\n\n"
-        
             f"👋 Chào <b>{name}</b>!\n\n"
             f"🆔 ID: <code>{uid}</code>\n"
             f"💰 Số dư: <b>{pay.fmt(user['balance'])}</b>\n\n"
@@ -402,7 +401,8 @@ async def expire_qr_loop(bot, kb_main_fn):
         try:
             expired = db.get_expired_payments()
             for pmt in expired:
-                db.expire_payment(pmt["payment_id"])
+                if not db.expire_payment(pmt["payment_id"]):
+                    continue
                 asyncio.create_task(_handle_expired(bot, pmt, kb_main_fn))
         except asyncio.CancelledError:
             return
