@@ -1,3 +1,4 @@
+# db.py
 import sqlite3
 import uuid
 import secrets
@@ -275,34 +276,20 @@ def get_payment_by_id(pid):
     return dict(r) if r else None
 
 
-def complete_payment(pid):
+def complete_payment(pid) -> bool:
     c = _conn()
-    try:
-        cur = c.execute(
-            "UPDATE pending_payments SET status='completed' "
-            "WHERE payment_id=? AND status='pending'",
-            (pid,)
-        )
-        changed = cur.rowcount > 0
-        c.commit()
-        return changed
-    finally:
-        c.close()
+    cur = c.execute(
+        "UPDATE pending_payments SET status='completed' WHERE payment_id=? AND status='pending'",
+        (pid,)
+    )
+    changed = cur.rowcount > 0
+    c.commit()
+    c.close()
+    return changed
 
 
 def expire_payment(pid):
-    c = _conn()
-    try:
-        cur = c.execute(
-            "UPDATE pending_payments SET status='expired' "
-            "WHERE payment_id=? AND status='pending'",
-            (pid,)
-        )
-        changed = cur.rowcount > 0
-        c.commit()
-        return changed
-    finally:
-        c.close()
+    c = _conn(); c.execute("UPDATE pending_payments SET status='expired' WHERE payment_id=?", (pid,)); c.commit(); c.close()
 
 
 def get_expired_payments():
