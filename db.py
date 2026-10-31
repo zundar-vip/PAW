@@ -277,14 +277,15 @@ def get_payment_by_id(pid):
 
 
 def complete_payment(pid) -> bool:
+    """Atomic guard: only updates if status='pending'. Returns True once, False on re-fire."""
     c = _conn()
     cur = c.execute(
-        "UPDATE pending_payments SET status='completed' WHERE payment_id=? AND status='pending'",
+        "UPDATE pending_payments SET status='completed' "
+        "WHERE payment_id=? AND status='pending'",
         (pid,)
     )
     changed = cur.rowcount > 0
-    c.commit()
-    c.close()
+    c.commit(); c.close()
     return changed
 
 
