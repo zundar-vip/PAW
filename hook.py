@@ -264,7 +264,19 @@ async def _process(rec: dict, source: str = "?"):
 
     expected = pmt["amount"]
     if amount < expected:
-        log.warning(f"[{source}] Underpayment: ref={ref} expected={expected} got={amount}")
+        log.warning(
+            f"[{source}] Underpayment BLOCKED: ref={ref} "
+            f"expected={expected} got={amount} uid={uid}"
+        )
+        if _notify_admin_tx_fn:
+            try:
+                await _notify_admin_tx_fn(
+                    amount, f"⚠️ THIẾU TIỀN — cần {expected}, nhận {amount} | ref={ref}",
+                    db.get_user(uid), ref, False
+                )
+            except Exception:
+                pass
+        return   # ← không giao key khi thiếu tiền
 
     log.info(f"[{source}] ✅ Payment confirmed: ref={ref} uid={uid} amount={amount}")
 
@@ -299,24 +311,24 @@ async def check_payment_now(ref: str, limit: int = 30) -> dict:
     try:
         async with aiohttp.ClientSession() as session:
             txs = await _fetch_transactions(session, limit=limit)
+        
+        for tx in txs:
+            if _tx_ref(tx) != ref:
+                continue
+            amount = _tx_amount_in(tx)
+            if amount <= 0:
+                continue
+            
+            tx_id = str(tx.get("id", ""))
+            _seen_tx_ids.add(tx_id)
+            
+            log.info(f"[manual_check] matched tx_id={tx_id} ref={ref}")
+            await _process({"amount": amount, "description": _tx_content(tx)}, source="manual_check")
+            return {"found": True, "reason": "success"}
+            
     except Exception as e:
-        log.error(f"check_payment_now fetch: {e}")
+        log.error(f"check_payment_now error: {e}")
         return {"found": False, "reason": "fetch_error"}
-
-    if not txs:
-        return {"found": False, "reason": "not_yet"}
-
-    for tx in txs:
-        if _tx_ref(tx) != ref:
-            continue
-        amount = _tx_amount_in(tx)
-        if amount <= 0:
-            continue
-        tx_id = str(tx.get("id", ""))
-        _seen_tx_ids.add(tx_id)
-        log.info(f"[manual_check] matched tx_id={tx_id} ref={ref}")
-        await _process({"amount": amount, "description": _tx_content(tx)}, source="manual_check")
-        return {"found": True, "reason": "success"}
 
     return {"found": False, "reason": "not_yet"}
 
@@ -381,6 +393,7 @@ async def _handle_expired(bot, pmt: dict, kb_main_fn):
             "⏰ <b>QR CODE ĐÃ HẾT HẠN</b>\n"
             "─────────────────────────────\n"
             "Mã QR hết hạn không có giao dịch.\n\n"
+        
             f"👋 Chào <b>{name}</b>!\n\n"
             f"🆔 ID: <code>{uid}</code>\n"
             f"💰 Số dư: <b>{pay.fmt(user['balance'])}</b>\n\n"
@@ -401,8 +414,7 @@ async def expire_qr_loop(bot, kb_main_fn):
         try:
             expired = db.get_expired_payments()
             for pmt in expired:
-                if not db.expire_payment(pmt["payment_id"]):
-                    continue
+                db.expire_payment(pmt["payment_id"])
                 asyncio.create_task(_handle_expired(bot, pmt, kb_main_fn))
         except asyncio.CancelledError:
             return
